@@ -1,0 +1,252 @@
+import io
+import json
+import logging
+import numpy as np
+import os
+import pandas as pd
+import pickle
+
+import time
+from typing import Dict, Any
+import sys
+from datetime import timezone
+import pytz 
+
+from datetime import datetime, timedelta
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, median_absolute_error, r2_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.datasets import fetch_california_housing
+
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.models import DAG, Variable
+from airflow.operators.python_operator import PythonOperator
+from airflow.utils.dates import days_ago
+
+_LOG = logging.getLogger()
+_LOG.addHandler(logging.StreamHandler())
+
+BUCKET = Variable.get("S3_BUCKET")
+FEATURES = [
+    "MedInc",
+    "HouseAge",
+    "AveRooms",
+    "AveBedrms",
+    "Population",
+    "AveOccup",
+    "Latitude",
+    "Longitude",
+]
+TARGET = "MedHouseVal"
+
+DEFAULT_ARGS = {
+    "owner": "Zolotukhin_Sergey",
+    "retry": 3,
+    "retry_delay": timedelta(minutes=1),
+}
+
+NAME_MODEL = HistGradientBoostingRegressor()
+
+dag = DAG(
+    dag_id=f"ZS_{type(NAME_MODEL).__name__}",
+    schedule_interval="0 1 * * *",
+    start_date=days_ago(2),
+    catchup=False,
+    tags=["mlops"],
+    default_args=DEFAULT_ARGS,
+)
+
+
+def init(test:str) -> Dict[str, Any]:
+    metrics = {}  
+    start_time_init = time.ctime() # время начала выполнения
+    
+    _LOG.info("Train pipeline started.")
+    _LOG.info(f"Hello, {test}!")
+    
+    metrics["start_time_init"] = start_time_init
+    metrics["name_model"] = type(NAME_MODEL).__name__
+    return metrics
+
+
+def download_data(**kwargs) -> Dict[str, Any]:
+    ti = kwargs["ti"]
+    metrics = ti.xcom_pull(task_ids = "init")
+    
+    # Получим датасет California housing
+    start_time_get_data = time.ctime() # время начала выполнения
+    housing = fetch_california_housing(as_frame=True)
+    # Объединим фичи и таргет в один np.array
+    data = pd.concat([housing["data"], pd.DataFrame(housing["target"])], axis=1)
+
+    # Использовать созданный ранее S3 connection
+    s3_hook = S3Hook("s3_connection")
+    filebuffer = io.BytesIO()
+    data.to_pickle(filebuffer)
+    filebuffer.seek(0)
+
+    # Сохранить файл в формате pkl на S3
+    s3_hook.load_file_obj(
+        file_obj=filebuffer,
+        key=f"{type(NAME_MODEL).__name__}/datasets/california_housing.pkl",
+        bucket_name=BUCKET,
+        replace=True)
+
+    _LOG.info("Data downloaded.")
+
+    end_time_get_data = time.ctime()  # время окончания выполнения
+    metrics["start_time_get_data"] = start_time_get_data
+    metrics["end_time_get_data"] = end_time_get_data
+    variable_size = sys.getsizeof(data)
+    metrics["dataset_size"] = f"{round(variable_size / 1048576, 2)} Mbyte"
+    return metrics
+  
+
+def prepare_data(**kwargs) -> Dict[str, Any]:
+    ti = kwargs["ti"]
+    metrics = ti.xcom_pull(task_ids = "download_data")
+    start_time_prepare_data = time.ctime() # время начала выполнения
+
+    # Использовать созданный ранее S3 connection
+    s3_hook = S3Hook("s3_connection")
+    file = s3_hook.download_file(key=f"{type(NAME_MODEL).__name__}/datasets/california_housing.pkl", bucket_name=BUCKET)
+    data = pd.read_pickle(file)
+
+    # Сделать препроцессинг
+    # Разделить на фичи и таргет
+    X, y = data[FEATURES], data[TARGET]
+
+    # Обучить стандартизатор на X
+    scaler = StandardScaler()
+    scaler.fit(X)
+    X = scaler.transform(X)
+  
+    # Разделить данные на обучение и тест
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    # Сохранить готовые данные на S3
+    session = s3_hook.get_session("ru-central1")
+    resource = session.resource("s3")
+
+    for name, data in zip(
+        ["X_train", "X_test", "y_train", "y_test"],
+        [X_train, X_test, y_train, y_test],
+    ):
+        filebuffer = io.BytesIO()
+        pickle.dump(data, filebuffer)
+        filebuffer.seek(0)
+        s3_hook.load_file_obj(
+            file_obj=filebuffer,
+            key=f"{type(NAME_MODEL).__name__}/datasets/{name}.pkl",
+            bucket_name=BUCKET,
+            replace=True)
+      
+    _LOG.info("Data prepared.")
+
+    end_time_prepare_data = time.ctime()  # время окончания выполнения  
+    metrics["start_time_prepare_data"] = start_time_prepare_data
+    metrics["end_time_prepare_data"] = end_time_prepare_data
+    metrics["name_features"] = FEATURES
+    return metrics
+
+
+def train_model(**kwargs) -> Dict[str, Any]:
+    ti = kwargs["ti"]
+    metrics = ti.xcom_pull(task_ids = "prepare_data")
+    start_time_train_model = time.ctime() # время начала выполнения
+
+    # Использовать созданный ранее S3 connection
+    s3_hook = S3Hook("s3_connection")
+    # Загрузить готовые данные с S3
+    data = {}
+    for name in ["X_train", "X_test", "y_train", "y_test"]:
+        file = s3_hook.download_file(
+            key=f"{type(NAME_MODEL).__name__}/datasets/{name}.pkl",
+            bucket_name=BUCKET,
+        )
+        data[name] = pd.read_pickle(file)
+
+    # Обучить модель
+    model = NAME_MODEL
+    model.fit(data["X_train"], data["y_train"])
+    prediction = model.predict(data["X_test"])
+
+    # Посчитать метрики
+    result = {}
+    result["r2_score"] = round(r2_score(data["y_test"], prediction), 2)
+    result["rmse"] = round(mean_squared_error(data["y_test"], prediction) ** 0.5, 2)
+    result["mae"] = round(median_absolute_error(data["y_test"], prediction), 2)
+
+    # Сохранить результат на S3
+    date = datetime.now(pytz.timezone('Europe/Moscow')).strftime("%H:%M%z %d-%m-%Y")
+    filebuffer = io.BytesIO()
+    filebuffer.write(json.dumps(result).encode())
+    filebuffer.seek(0)
+    s3_hook.load_file_obj(
+        file_obj=filebuffer,
+        key=f"{type(NAME_MODEL).__name__}/score/score {date}.pkl",
+        bucket_name=BUCKET,
+        replace=True,
+    )
+    _LOG.info("Model trained.")
+
+    end_time_train_model = time.ctime()  # время окончания выполнения  
+    metrics["start_time_train_model"] = start_time_train_model
+    metrics["end_time_train_model"] = end_time_train_model
+    metrics = {**metrics, **result}
+    return metrics
+
+
+def save_results(**kwargs) -> Dict[str, Any]:
+    ti = kwargs["ti"]
+    metrics = ti.xcom_pull(task_ids = "train_model")
+
+    print("Success")
+    _LOG.info("Success.")
+
+    # Сохранить результат на S3
+    date = datetime.now(pytz.timezone('Europe/Moscow')).strftime("%H:%M%z %d-%m-%Y")
+    filebuffer = io.BytesIO()
+    filebuffer.write(json.dumps(metrics).encode())
+    filebuffer.seek(0)
+    s3_hook = S3Hook("s3_connection")
+    s3_hook.load_file_obj(
+        file_obj=filebuffer,
+        key=f"{type(NAME_MODEL).__name__}/metrics/metrics {date}.json",
+        bucket_name=BUCKET,
+        replace=True,
+    ) 
+  
+    
+task_init = PythonOperator(task_id="init", 
+                           python_callable=init, 
+                           dag=dag, 
+                           op_kwargs = {"test":NAME_MODEL})
+
+task_download_data = PythonOperator(task_id="download_data", 
+                                    python_callable=download_data, 
+                                    dag=dag, 
+                                    provide_context = True)
+
+task_prepare_data = PythonOperator(task_id="prepare_data", 
+                                   python_callable=prepare_data, 
+                                   dag=dag,
+                                   provide_context = True)
+
+task_train_model = PythonOperator(task_id="train_model", 
+                                  python_callable=train_model, 
+                                  dag=dag,
+                                  provide_context = True)
+
+task_save_results = PythonOperator(task_id="save_results", 
+                                   python_callable=save_results, 
+                                   dag=dag,
+                                   #provide_context = True
+                                  )
+
+task_init >> task_download_data >> task_prepare_data >> task_train_model >> task_save_results
