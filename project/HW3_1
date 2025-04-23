@@ -3,7 +3,6 @@ from mlflow.tracking import MlflowClient
 from mlflow.models import infer_signature
 from mlflow.store.artifact.artifact_repository_registry import get_artifact_repository
 
-# YOUR IMPORTS HERE
 import io
 import json
 import logging
@@ -32,7 +31,6 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.models import DAG, Variable
 from airflow.operators.python_operator import PythonOperator
 from airflow.utils.dates import days_ago
-
 
 _LOG = logging.getLogger()
 _LOG.addHandler(logging.StreamHandler())
@@ -69,6 +67,7 @@ DEFAULT_ARGS = {
 NAME_MODEL = HistGradientBoostingRegressor()
 EXP_NAME = 'zolotukhin_s'
 
+
 dag = DAG(
     dag_id=f"ZS_{type(NAME_MODEL).__name__}",
     schedule_interval="0 1 * * *",
@@ -77,6 +76,7 @@ dag = DAG(
     tags=["mlops"],
     default_args=DEFAULT_ARGS,
 )
+
 
 def init(test:str) -> Dict[str, Any]:
     metrics = {}  
@@ -96,6 +96,7 @@ def init(test:str) -> Dict[str, Any]:
     metrics["name_model"] = type(NAME_MODEL).__name__
     metrics["experiment_id"] = mlflow.set_experiment(EXP_NAME).experiment_id
     return metrics
+
 
 def download_data(**kwargs) -> Dict[str, Any]:
     ti = kwargs["ti"]
